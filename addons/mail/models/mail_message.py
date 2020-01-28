@@ -4,14 +4,14 @@
 import logging
 import re
 
-from email.utils import formataddr
+from openerp.http import request
 
 from odoo import _, api, fields, models, modules, SUPERUSER_ID, tools
 from odoo.exceptions import UserError, AccessError
 from odoo.osv import expression
 
 _logger = logging.getLogger(__name__)
-_image_dataurl = re.compile(r'(data:image/[a-z]+?);base64,([a-z0-9+/\n]{3,}=*)\n*([\'"])', re.I)
+_image_dataurl = re.compile(r'(data:image/[a-z]+?);base64,([a-z0-9+/\n]{3,}=*)\n*([\'"])(?: data-filename="([^"]*)")?', re.I)
 
 
 class Message(models.Model):
@@ -27,7 +27,7 @@ class Message(models.Model):
     @api.model
     def _get_default_from(self):
         if self.env.user.email:
-            return formataddr((self.env.user.name, self.env.user.email))
+            return tools.formataddr((self.env.user.name, self.env.user.email))
         raise UserError(_("Unable to send email, please configure the sender's email address."))
 
     @api.model
@@ -299,11 +299,12 @@ class Message(models.Model):
 
         # 2. Attachments as SUPERUSER, because could receive msg and attachments for doc uid cannot see
         attachments_data = attachments.sudo().read(['id', 'datas_fname', 'name', 'mimetype'])
+        safari = request and request.httprequest.user_agent.browser == 'safari'
         attachments_tree = dict((attachment['id'], {
             'id': attachment['id'],
             'filename': attachment['datas_fname'],
             'name': attachment['name'],
-            'mimetype': attachment['mimetype'],
+            'mimetype': 'application/octet-stream' if safari and attachment['mimetype'] and 'video' in attachment['mimetype'] else attachment['mimetype'],
         }) for attachment in attachments_data)
 
         # 3. Tracking values
@@ -421,8 +422,18 @@ class Message(models.Model):
         subtype_ids = [msg['subtype_id'][0] for msg in message_values if msg['subtype_id']]
         subtypes = self.env['mail.message.subtype'].sudo().browse(subtype_ids).read(['internal', 'description'])
         subtypes_dict = dict((subtype['id'], subtype) for subtype in subtypes)
+
+        # fetch notification status
+        notif_dict = {}
+        notifs = self.env['mail.notification'].sudo().search([('mail_message_id', 'in', list(mid for mid in message_tree)), ('is_read', '=', False)])
+        for notif in notifs:
+            mid = notif.mail_message_id.id
+            if not notif_dict.get(mid):
+                notif_dict[mid] = {'partner_id': list()}
+            notif_dict[mid]['partner_id'].append(notif.res_partner_id.id)
+
         for message in message_values:
-            message['needaction_partner_ids'] = self.env['mail.notification'].sudo().search([('mail_message_id', '=', message['id']), ('is_read', '=', False)]).mapped('res_partner_id').ids
+            message['needaction_partner_ids'] = notif_dict.get(message['id'], dict()).get('partner_id', [])
             message['is_note'] = message['subtype_id'] and subtypes_dict[message['subtype_id'][0]]['internal']
             message['subtype_description'] = message['subtype_id'] and subtypes_dict[message['subtype_id'][0]]['description']
             if message['model'] and self.env[message['model']]._original_module:
@@ -583,8 +594,9 @@ class Message(models.Model):
                                 WHERE message.message_type = %%s AND (message.subtype_id IS NULL OR subtype.internal IS TRUE) AND message.id = ANY (%%s)''' % (self._table), ('comment', self.ids,))
             if self._cr.fetchall():
                 raise AccessError(
-                    _('The requested operation cannot be completed due to security restrictions. Please contact your system administrator.\n\n(Document type: %s, Operation: %s)') %
-                    (self._description, operation))
+                    _('The requested operation cannot be completed due to security restrictions. Please contact your system administrator.\n\n(Document type: %s, Operation: %s)') % (self._description, operation)
+                    + ' - ({} {}, {} {})'.format(_('Records:'), self.ids[:6], _('User:'), self._uid)
+                )
 
         # Read mail_message.ids to have their values
         message_values = dict((res_id, {}) for res_id in self.ids)
@@ -683,8 +695,9 @@ class Message(models.Model):
         if not (other_ids and self.browse(other_ids).exists()):
             return
         raise AccessError(
-            _('The requested operation cannot be completed due to security restrictions. Please contact your system administrator.\n\n(Document type: %s, Operation: %s)') %
-            (self._description, operation))
+            _('The requested operation cannot be completed due to security restrictions. Please contact your system administrator.\n\n(Document type: %s, Operation: %s)') % (self._description, operation)
+            + ' - ({} {}, {} {})'.format(_('Records:'), list(other_ids)[:6], _('User:'), self._uid)
+        )
 
     @api.model
     def _get_record_name(self, values):
@@ -750,12 +763,13 @@ class Message(models.Model):
             def base64_to_boundary(match):
                 key = match.group(2)
                 if not data_to_url.get(key):
-                    name = 'image%s' % len(data_to_url)
+                    name = match.group(4) if match.group(4) else 'image%s' % len(data_to_url)
                     attachment = Attachments.create({
                         'name': name,
                         'datas': match.group(2),
                         'datas_fname': name,
-                        'res_model': 'mail.message',
+                        'res_model': values.get('model'),
+                        'res_id': values.get('res_id'),
                     })
                     attachment.generate_access_token()
                     values['attachment_ids'].append((4, attachment.id))
@@ -766,6 +780,10 @@ class Message(models.Model):
         # delegate creation of tracking after the create as sudo to avoid access rights issues
         tracking_values_cmd = values.pop('tracking_value_ids', False)
         message = super(Message, self).create(values)
+
+        if values.get('attachment_ids'):
+            message.attachment_ids.check(mode='read')
+
         if tracking_values_cmd:
             message.sudo().write({'tracking_value_ids': tracking_values_cmd})
 
@@ -788,6 +806,9 @@ class Message(models.Model):
         if 'model' in vals or 'res_id' in vals:
             self._invalidate_documents()
         res = super(Message, self).write(vals)
+        if vals.get('attachment_ids'):
+            for mail in self:
+                mail.attachment_ids.check(mode='read')
         self._invalidate_documents()
         return res
 

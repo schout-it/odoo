@@ -73,6 +73,13 @@ class StockMove(models.Model):
     order_finished_lot_ids = fields.Many2many('stock.production.lot', compute='_compute_order_finished_lot_ids')
     finished_lots_exist = fields.Boolean('Finished Lots Exist', compute='_compute_order_finished_lot_ids')
 
+    def _unreserve_initial_demand(self, new_move):
+        # If you were already putting stock.move.lots on the next one in the work order, transfer those to the new move
+        self.filtered(lambda m: m.production_id or m.raw_material_production_id)\
+        .mapped('move_line_ids')\
+        .filtered(lambda ml: ml.qty_done == 0.0)\
+        .write({'move_id': new_move, 'product_uom_qty': 0})
+
     @api.depends('active_move_line_ids.qty_done', 'active_move_line_ids.product_uom_id')
     def _compute_done_quantity(self):
         super(StockMove, self)._compute_done_quantity()
@@ -175,6 +182,24 @@ class StockMove(models.Model):
         self.sudo().unlink()
         return processed_moves
 
+    def _decrease_reserved_quanity(self, quantity):
+        """ Decrease the reservation on move lines but keeps the
+        all other data.
+        """
+        move_line_to_unlink = self.env['stock.move.line']
+        for move in self:
+            reserved_quantity = quantity
+            for move_line in self.move_line_ids:
+                if move_line.product_uom_qty > reserved_quantity:
+                    move_line.product_uom_qty = reserved_quantity
+                else:
+                    move_line.product_uom_qty = 0
+                    reserved_quantity -= move_line.product_uom_qty
+                if not move_line.product_uom_qty and not move_line.qty_done:
+                    move_line_to_unlink |= move_line
+        move_line_to_unlink.unlink()
+        return True
+
     def _prepare_phantom_move_values(self, bom_line, quantity):
         return {
             'picking_id': self.picking_id.id if self.picking_id else False,
@@ -231,7 +256,7 @@ class StockMove(models.Model):
                 ), self.product_uom
             )
             location_id = False
-            if float_compare(qty_to_add, available_quantity, precision_rounding=self.product_uom.rounding) < 0:
+            if float_compare(qty_to_add, available_quantity, precision_rounding=self.product_uom.rounding) < 1:
                 location_id = quants.filtered(lambda r: r.quantity > 0)[-1:].location_id
 
             vals = {
@@ -248,6 +273,9 @@ class StockMove(models.Model):
                 vals.update({'lot_id': lot.id})
             self.env['stock.move.line'].create(vals)
 
+    def _should_be_assigned(self):
+        res = super(StockMove, self)._should_be_assigned()
+        return bool(res and not (self.production_id or self.raw_material_production_id))
 
 class PushedFlow(models.Model):
     _inherit = "stock.location.path"

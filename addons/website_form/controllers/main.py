@@ -112,6 +112,7 @@ class WebsiteForm(http.Controller):
             'record': {},        # Values to create record
             'attachments': [],  # Attached files
             'custom': '',        # Custom fields values
+            'meta': '',         # Add metadata if enabled
         }
 
         authorized_fields = model.sudo()._get_form_writable_fields()
@@ -122,7 +123,7 @@ class WebsiteForm(http.Controller):
             # If the value of the field if a file
             if hasattr(field_value, 'filename'):
                 # Undo file upload field name indexing
-                field_name = field_name.rsplit('[', 1)[0]
+                field_name = field_name.split('[', 1)[0]
 
                 # If it's an actual binary field, convert the input file
                 # If it's not, we'll use attachments instead
@@ -220,10 +221,10 @@ class WebsiteForm(http.Controller):
             else:
                 orphan_attachment_ids.append(attachment_id.id)
 
-        # If some attachments didn't match a field on the model,
-        # we create a mail.message to link them to the record
-        if orphan_attachment_ids:
-            if model_name != 'mail.mail':
+        if model_name != 'mail.mail':
+            # If some attachments didn't match a field on the model,
+            # we create a mail.message to link them to the record
+            if orphan_attachment_ids:
                 values = {
                     'body': _('<p>Attached files : </p>'),
                     'model': model_name,
